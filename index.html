@@ -330,7 +330,9 @@ function gameplayStop() {
   try { if (ysdk && ysdk.features && ysdk.features.GameplayAPI) ysdk.features.GameplayAPI.stop(); } catch(e){}
 }
 function showRewardedVideo(onReward, onClose) {
+  console.log('[ADV] showRewardedVideo called');
   if (!ysdk || !ysdk.adv || !ysdk.adv.showRewardedVideo) {
+    console.log('[ADV] SDK unavailable, calling onReward directly');
     if (onReward) onReward();
     if (onClose) onClose();
     return;
@@ -338,13 +340,13 @@ function showRewardedVideo(onReward, onClose) {
   try {
     ysdk.adv.showRewardedVideo({
       callbacks: {
-        onRewarded: function() { if (onReward) onReward(); },
-        onClose: function() { if (onClose) onClose(); },
-        onError: function(e) { console.error('Adv error:', e); if (onClose) onClose(); }
+        onRewarded: function() { console.log('[ADV] onRewarded'); if (onReward) onReward(); },
+        onClose: function() { console.log('[ADV] onClose'); if (onClose) onClose(); },
+        onError: function(e) { console.error('[ADV] onError:', e); if (onClose) onClose(); }
       }
     });
   } catch(e) {
-    console.error(e);
+    console.error('[ADV] Exception:', e);
     if (onReward) onReward();
     if (onClose) onClose();
   }
@@ -430,8 +432,11 @@ var currentLoc = 'forest';
 var unlockedLocs = ['forest'];
 var battle = { active:false };
 var invCat = 'all', shopCat = 'all';
+
+// === АВТОАТАКА: глобальный флаг, не сбрасывается автоматически ===
 var autoAttack = false;
 var autoTimer = null;
+
 var upgradeItem = null;
 var _saveTimer = null;
 var stats = { monstersKilled:0, bossesKilled:0, pvpWins:0, maxGold:0, upgradesSuccess:0 };
@@ -445,8 +450,8 @@ var bossCooldowns = {};
 var BOSS_COOLDOWN_TIME = 5 * 60 * 1000;
 
 var chestTimers = { bronze: 0, silver: 0, gold: 0, premium: 0 };
+var chestClaiming = false;
 
-// Башня Хаоса
 var towerProgress = 0;
 var towerInBattle = false;
 
@@ -617,7 +622,6 @@ function applySaveData(d) {
   var p = d.player;
   player = { name: p.name, cls: p.cls, level: p.level, hp: p.hp, maxhp: p.maxhp, exp: p.exp, expNext: p.expNext, gold: p.gold, materials: p.materials||0, baseAttack: p.baseAttack, baseDefense: p.baseDefense, baseMaxhp: p.baseMaxhp, attack: 0, defense: 0, str: p.str||0, agi: p.agi||0, vit: p.vit||0, statPoints: p.statPoints||0, critChance: 5, critMult: 1.7, dodge: 0, buffs: {} };
   inventory = (d.inventory||[]).map(function(i){ 
-    // Миграция старых ID
     var id = i.id;
     if (id === 'a_legendm') id = 'a_archmage';
     if (id === 'w_legendm') id = 'w_archmage';
@@ -644,7 +648,15 @@ function applySaveData(d) {
   boughtThemes = d.boughtThemes || ['default'];
   playerTitles = d.playerTitles || [];
   bossCooldowns = d.bossCooldowns || {};
-  chestTimers = d.chestTimers || { bronze: 0, silver: 0, gold: 0, premium: 0 };
+  
+  chestTimers = d.chestTimers || {};
+  var _now = Date.now();
+  ['bronze','silver','gold','premium'].forEach(function(id){
+    if (!chestTimers[id] || chestTimers[id] <= 0) {
+      chestTimers[id] = _now;
+    }
+  });
+  
   towerProgress = (d.tower && d.tower.progress) || 0;
   recalcPlayerStats(); 
   if (currentTheme !== 'default' && THEMES[currentTheme]) applyTheme(currentTheme);
@@ -669,7 +681,9 @@ function chooseClass(cls) {
   player = { name:'Герой', cls:cls, level:1, hp:d.hp, maxhp:d.hp, exp:0, expNext:expForLevel(1), gold:50, materials:0, baseAttack:d.attack, baseDefense:d.defense, baseMaxhp:d.hp, attack:d.attack, defense:d.defense, str:0, agi:0, vit:0, statPoints:0, critChance:d.crit, critMult:1.7, dodge:d.dodge, buffs:{} };
   inventory = []; equipped = {weapon:null,armor:null,helm:null,gloves:null,boots:null};
   bossCooldowns = {};
-  chestTimers = { bronze: 0, silver: 0, gold: 0, premium: 0 };
+  var now = Date.now();
+  chestTimers = { bronze: now, silver: now, gold: now, premium: now };
+  chestClaiming = false;
   playerTitles = [];
   towerProgress = 0;
   stats = { monstersKilled:0, bossesKilled:0, pvpWins:0, maxGold:0, upgradesSuccess:0 };
@@ -1048,25 +1062,47 @@ function renderAchievements() {
 /* ============================================================
    BATTLE
    ============================================================ */
-function startBattle(mid) {
-  if (inventory.length >= MAX_INVENTORY) {
+function startBattle(mid, isAutoFarm) {
+  if (inventory.length >= MAX_INVENTORY && !isAutoFarm) {
     log('⚠️ Инвентарь полон! Лут не будет помещаться. Продай или выброси что-нибудь.');
     return;
   }
   var m = MONSTERS[mid]; 
+  if (!m) return;
   var loc = LOCATIONS[currentLoc]; 
   var scale = 1 + (loc.lvl-1)*0.3; 
   var hp = Math.round(m.hp * scale);
+  
+  if (!isAutoFarm) {
+    document.getElementById('battle-log').innerHTML = '';
+  }
+  
   battle = { 
     active:true, 
-    monster:{ name:m.name, hp:hp, maxhp:hp, attack:Math.round(m.attack*scale), defense:Math.round(loc.lvl*1.5), critChance:5, dodge:0, expMult:m.expMult, goldMult:m.goldMult, locLvl:loc.lvl, loc:currentLoc }, 
-    cooldowns:{}, isPvP:false, isBoss:false 
+    monsterId: mid,
+    autoFarm: true,
+    monster:{ 
+      name:m.name, 
+      hp:hp, 
+      maxhp:hp, 
+      attack:Math.round(m.attack*scale), 
+      defense:Math.round(loc.lvl*1.5), 
+      critChance:5, 
+      dodge:0, 
+      expMult:m.expMult, 
+      goldMult:m.goldMult, 
+      locLvl:loc.lvl, 
+      loc:currentLoc 
+    }, 
+    cooldowns:{}, 
+    isPvP:false, 
+    isBoss:false 
   };
-  gameplayStart();
+  
+  if (!isAutoFarm) gameplayStart();
   showScreen('battle'); 
   document.getElementById('monster-name').textContent = m.name; 
-  document.getElementById('battle-log').innerHTML = ''; 
-  battleLog('⚔️ Бой: '+m.name); 
+  battleLog((isAutoFarm ? '🔄 Новый противник: ' : '⚔️ Бой: ') + m.name); 
   renderSkills(); 
   updateBattleUI();
 }
@@ -1081,6 +1117,7 @@ function startBossBattle() {
   if (Date.now() < nextAvailable) return log('⏳ Босс еще не восстановился!');
   battle = { 
     active:true, 
+    autoFarm: false,
     monster:{ name:b.name, hp:b.hp, maxhp:b.hp, attack:b.attack, defense:10, critChance:10, dodge:0, isBoss:true, loc:currentLoc, mechanic:b.mechanic, lastTick:Date.now(), lastRegen:Date.now(), poison:null }, 
     cooldowns:{}, isPvP:false, isBoss:true 
   };
@@ -1109,6 +1146,7 @@ function updateBattleUI() {
 }
 
 function playerAttack() {
+  if (!battle.active) return;
   var m = battle.monster; var res;
   if (player.buffs.guaranteedCrit && Date.now() < player.buffs.guaranteedCrit) { 
     res = rollDamage(player, m, player.attack*0.9, player.attack*1.1); 
@@ -1146,10 +1184,19 @@ function winBattle() {
   if (battle.isTower) { return towerWin(); }
   // === /БАШНЯ ХАОСА ===
   
-  var m = battle.monster; var isBoss = battle.isBoss; var isPvP = battle.isPvP; 
-  battle.active = false; stopAuto(); gameplayStop(); 
+  var m = battle.monster; 
+  var isBoss = battle.isBoss; 
+  var isPvP = battle.isPvP; 
+  var isFarmable = battle.autoFarm && !isBoss && !isPvP;
+  var monsterId = battle.monsterId;
+  
+  battle.active = false; 
+  
   var rew;
+  
+  // === БОСС ===
   if (isBoss) { 
+    gameplayStop();
     rew = monsterReward(LOCATIONS[currentLoc].lvl, true); 
     battleLog('🎁 Победа над боссом!'); 
     BOSSES[currentLoc].loot.forEach(function(l){ 
@@ -1160,28 +1207,60 @@ function winBattle() {
     stats.bossesKilled++; 
     bossCooldowns[currentLoc] = Date.now() + BOSS_COOLDOWN_TIME;
   }
+  // === PVP ===
   else if (isPvP) { 
+    gameplayStop();
     rew = {exp: Math.round(expForLevel(player.level)*0.5), gold: 50 + player.level*10}; 
     battleLog('🏆 PvP победа!'); 
     stats.pvpWins++; 
   }
+  // === ОБЫЧНЫЙ МОБ ===
   else { 
     rew = monsterReward(m.locLvl||1, false); 
     rew.exp = Math.round(rew.exp * (m.expMult||1)); 
     rew.gold = Math.round(rew.gold * (m.goldMult||1)); 
     stats.monstersKilled++; 
-    // Шанс дропа легендарки с обычных монстров
     dropLegendaryOrLog();
   }
+  
   var goldMult = (player.buffs.goldMult && Date.now() < player.buffs.goldUntil) ? player.buffs.goldMult : 1; 
   rew.gold = Math.round(rew.gold * goldMult); 
   player.gold += rew.gold; 
   stats.maxGold = Math.max(stats.maxGold, player.gold); 
   gainExp(rew.exp);
-  battleLog('+'+rew.exp+' XP, +'+rew.gold+' 🪙'); 
+  battleLog('+' + rew.exp + ' XP, +' + rew.gold + ' 🪙'); 
   checkAchievements(); 
   renderAll(); 
-  scheduleSave(); 
+  scheduleSave();
+  
+  // === РЕСПАВН ИЛИ ВОЗВРАТ ===
+  if (isFarmable) {
+    // Реген HP между мобами: +10% max HP
+    var regen = Math.round(player.maxhp * 0.10);
+    player.hp = Math.min(player.maxhp, player.hp + regen);
+    battleLog('💚 +' + regen + ' HP (реген)');
+    
+    // Если инвентарь полон — автостоп (даже если была автоатака)
+    if (inventory.length >= MAX_INVENTORY) {
+      battleLog('🎒 Инвентарь полон! Возврат в город');
+      stopAuto();
+      gameplayStop();
+      setTimeout(function(){ if (!battle.active) showScreen('main'); }, 1200);
+      return;
+    }
+    
+    // Респавн того же моба (автоатака сохраняется)
+    setTimeout(function(){ 
+      if (!battle.active && monsterId) {
+        startBattle(monsterId, true);
+      }
+    }, 900);
+    return;
+  }
+  
+  // Босс/PvP — возврат в город
+  gameplayStop();
+  stopAuto();
   setTimeout(function(){ if (!battle.active) showScreen('main'); }, 1200);
 }
 
@@ -1190,14 +1269,30 @@ function loseBattle() {
   if (battle.isTower) { return towerLose(); }
   // === /БАШНЯ ХАОСА ===
   
-  battle.active = false; stopAuto(); gameplayStop(); 
-  // Возврат в город + восстановление 30% HP вместо 1 HP
+  var wasFarm = battle.autoFarm && !battle.isBoss && !battle.isPvP;
+  var monsterId = battle.monsterId;
+  battle.active = false; 
+  
   player.hp = Math.round(player.maxhp * 0.3);
   if (player.hp < 1) player.hp = 1;
-  battleLog('💀 Поражение... Возврат в город, восстановлено 30% HP'); 
+  
+  if (wasFarm) {
+    battleLog('💀 Поражение! 30% HP. Продолжаем фарм...'); 
+    // Автоатака сохраняется — продолжаем фармить того же моба
+    setTimeout(function(){ 
+      if (!battle.active && monsterId) {
+        startBattle(monsterId, true);
+      }
+    }, 1500);
+  } else {
+    battleLog('💀 Поражение... Возврат в город, восстановлено 30% HP'); 
+    stopAuto();
+    gameplayStop();
+    setTimeout(function(){ if (!battle.active) showScreen('main'); }, 1500); 
+  }
+  
   renderAll(); 
   scheduleSave(); 
-  setTimeout(function(){ if (!battle.active) showScreen('main'); }, 1500); 
 }
 
 function flee() { 
@@ -1206,9 +1301,11 @@ function flee() {
   if (battle.isTower) { return towerFlee(); }
   // === /БАШНЯ ХАОСА ===
   
-  battle.active = false; stopAuto(); gameplayStop(); 
+  battle.active = false; 
+  stopAuto(); 
+  gameplayStop(); 
   showScreen('main'); 
-  log('🏃 Ты сбежал'); 
+  log('🏃 Ты вышел из боя'); 
   scheduleSave(); 
 }
 
@@ -1219,7 +1316,13 @@ function toggleAutoAttack() {
   var btn = document.getElementById('auto-btn'); 
   btn.textContent = '⏹️ Стоп'; 
   btn.classList.add('stop-btn'); 
-  autoTimer = setInterval(function(){ if (!battle.active) return stopAuto(); attack(); }, 800); 
+  autoTimer = setInterval(function(){ 
+    // Автоатака работает ТОЛЬКО если есть активный бой
+    if (battle.active) {
+      attack();
+    }
+    // НЕ останавливаемся, если бой временно неактивен (респавн) — ждём
+  }, 800); 
 }
 function stopAuto() { 
   autoAttack = false; 
@@ -1503,13 +1606,17 @@ function renderChests() {
   var now = Date.now();
   el.innerHTML = Object.keys(CHESTS).map(function(id){
     var c = CHESTS[id];
-    var lastOpen = chestTimers[id] || 0;
+    var lastOpen = chestTimers[id] || now;
     var nextOpen = lastOpen + c.cooldown;
-    var isReady = false;
+    var isReady = now >= nextOpen;
     var timeLeftStr = '';
-    if (now >= nextOpen) {
-      isReady = true;
-      timeLeftStr = c.id === 'premium' ? '▶️ Смотреть рекламу' : '🎁 Забрать';
+
+    if (isReady) {
+      if (c.id === 'premium') {
+        timeLeftStr = chestClaiming ? '⏳ Загрузка рекламы...' : '▶️ Смотреть рекламу';
+      } else {
+        timeLeftStr = '🎁 Забрать';
+      }
     } else {
       var left = Math.ceil((nextOpen - now) / 1000);
       var h = Math.floor(left / 3600);
@@ -1519,38 +1626,54 @@ function renderChests() {
       else if (m > 0) timeLeftStr = '⏳ ' + m + 'м ' + s + 'с';
       else timeLeftStr = '⏳ ' + s + 'с';
     }
+
+    var disabled = !isReady || (c.id === 'premium' && chestClaiming);
+
     return '<div class="item-row" style="flex-direction: column; align-items: stretch; gap: 10px;">'+
       '<div style="display:flex; justify-content:space-between; align-items:center;">'+
         '<div class="item-info"><b>'+c.name+'</b><div class="item-desc">'+c.desc+'</div></div>'+
         '<div style="font-size: 24px;">'+c.name.split(' ')[0]+'</div>'+
       '</div>'+
-      '<button class="buy-btn" '+(isReady?'':'disabled')+' onclick="claimChest(\''+id+'\')">'+timeLeftStr+'</button>'+
+      '<button class="buy-btn" '+(disabled?'disabled':'')+' onclick="claimChest(\''+id+'\')">'+timeLeftStr+'</button>'+
     '</div>';
   }).join('');
 }
 
 function claimChest(id) {
+  if (chestClaiming) return;
   var c = CHESTS[id];
   if (!c) return;
+  
   var lastOpen = chestTimers[id] || 0;
-  if (Date.now() < lastOpen + c.cooldown) return log('⏳ Сундук еще не готов!');
+  if (Date.now() < lastOpen + c.cooldown) {
+    return log('⏳ Сундук еще не готов!');
+  }
 
   if (c.id === 'premium') {
-    // Rewarded video
+    chestClaiming = true;
+    renderChests();
+    
+    var rewarded = false;
+    
     showRewardedVideo(
       function() {
-        // onRewarded — выдаём награду
+        if (rewarded) return;
+        rewarded = true;
+        
         chestTimers[id] = Date.now();
         var rew = c.rewards();
         player.gold += rew.gold;
         rew.items.forEach(function(i){ addItem(i, 1); });
-        log('🎁 '+c.name+': +'+rew.gold+'🪙 и '+rew.items.length+' предметов');
+        log('🎁 ' + c.name + ': +' + rew.gold + '🪙 и ' + rew.items.length + ' предметов');
         renderAll();
-        renderChests();
         scheduleSave();
       },
       function() {
-        // onClose без награды (закрыл/ошибка) — просто ничего не делаем
+        chestClaiming = false;
+        renderChests();
+        if (!rewarded) {
+          log('📺 Реклама не просмотрена — награда не выдана. Попробуй снова.');
+        }
       }
     );
     return;
@@ -1560,7 +1683,7 @@ function claimChest(id) {
   var rew = c.rewards();
   player.gold += rew.gold;
   rew.items.forEach(function(i){ addItem(i, 1); });
-  log('🎁 '+c.name+': +'+rew.gold+'🪙 и '+rew.items.length+' предметов');
+  log('🎁 ' + c.name + ': +' + rew.gold + '🪙 и ' + rew.items.length + ' предметов');
   renderAll();
   renderChests();
   scheduleSave();
@@ -1656,6 +1779,7 @@ function startTowerFloor() {
 
   battle = {
     active: true,
+    autoFarm: false,
     monster: {
       name: st.name,
       hp: st.hp,
@@ -1811,7 +1935,6 @@ setInterval(function(){
   updateBattleUI();
 }, 1000);
 
-// Обновление таймера босса точечно
 setInterval(function() {
   if (document.getElementById('screen-main').classList.contains('active')) {
     var el = document.getElementById('boss-list');
@@ -1835,17 +1958,14 @@ setInterval(function() {
   }
 }, 1000);
 
-// Обновление скиллов только в бою
 setInterval(function(){ if (battle.active) renderSkills(); }, 500);
 
-// Таймеры сундуков
 setInterval(function() {
   if (document.getElementById('chest-modal').style.display === 'block') {
     renderChests();
   }
 }, 1000);
 
-// Запуск
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initYandexSDK);
 } else {
